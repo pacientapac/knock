@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QUIC Port Knock</title>
+<style>
+  :root { color-scheme: dark; --bg:#0f1115; --fg:#e6e8ee; --muted:#8b93a7; --line:#252a35; --accent:#5b8cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px; font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--bg); color:var(--fg); }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 6px; }
+  .note { color: var(--muted); margin: 0 0 20px; font-size: 12px; line-height: 1.6; }
+  fieldset { border:1px solid var(--line); border-radius:8px; padding:16px; margin:0 0 16px; }
+  legend { color: var(--muted); padding: 0 6px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; }
+  .field { display:flex; flex-direction:column; gap:4px; flex:1 1 180px; }
+  label { color: var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+  input, select { background:#161a22; border:1px solid var(--line); color:var(--fg); border-radius:6px; padding:8px 10px; font:inherit; width:100%; }
+  input:focus { outline:1px solid var(--accent); }
+  .fixed { background:#0e1118; border:1px solid var(--line); color:var(--muted); border-radius:6px; padding:8px 10px; }
+  .ports { display:flex; flex-direction:column; gap:8px; }
+  .port { display:flex; gap:8px; align-items:center; }
+  .port .idx { color:var(--muted); width:22px; }
+  button { background:#1b2030; border:1px solid var(--line); color:var(--fg); border-radius:6px; padding:8px 14px; font:inherit; cursor:pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .primary { background: var(--accent); border-color: var(--accent); color:#08101f; font-weight:600; }
+  .actions { display:flex; gap:10px; margin-bottom:16px; align-items:center; }
+  .status { margin-left:auto; color:var(--muted); }
+  .warn { color:#fbbf24; } .bad { color:#f87171; } .ok { color:#4ade80; } .muted { color:var(--muted); }
+  #log { background:#0a0c11; border:1px solid var(--line); border-radius:8px; padding:12px; height:300px; overflow:auto; white-space:pre-wrap; }
+  .banner { display:none; border:1px solid #4a3a12; background:#1d1708; color:#fbbf24; border-radius:8px; padding:12px; margin:0 0 16px; }
+  .banner.show { display:block; }
+</style>
+</head>
+<body>
+<main>
+  <h1>QUIC Port Knock</h1>
+  <p class="sub">UDP only, via a WebTransport QUIC Initial. No server, no dependencies.</p>
+  <p class="note">Avoid the browser's blocked ports &mdash; 25, 110, 143, 6000, 6667, 6697, 10080 and ~70 others &mdash; which
+  Chromium refuses outright, so no datagram ever leaves. Those are marked red below.
+  Each port gets one <code>new WebTransport("https://host:port")</code>, which emits a 1250-byte QUIC Initial
+  datagram within ~20&nbsp;ms and then keeps retransmitting until dropped. <strong>Hold</strong> is how long each connection
+  stays open: it caps packets per port and keeps the spacing honest, so keep it small (300&nbsp;ms suits most setups).
+  Chromium stops opening new QUIC connections to a host after a run of failed handshakes &mdash; and a knock is nothing but
+  failed handshakes &mdash; so long sequences can end with ports that send <em>nothing</em>. Knock about 5 at a time, and between batches fully
+  quit the browser (all windows) and reopen this file &mdash; reloading the page is not enough, because that limit lives in the browser
+  process. The page cannot see its own datagrams, so confirm delivery from your target's log.</p>
+
+  <div class="banner" id="banner"></div>
+
+  <fieldset>
+    <legend>Target</legend>
+    <div class="row">
+      <div class="field" style="flex:2 1 280px">
+        <label for="host">Host</label>
+        <input id="host" value="127.0.0.1" spellcheck="false" autocomplete="off" placeholder="hostname or IP">
+      </div>
+      <div class="field" style="flex:0 0 130px">
+        <label for="protocol">Protocol</label>
+        <div class="fixed">UDP (QUIC)</div>
+      </div>
+      <div class="field" style="flex:0 0 150px">
+        <label for="delay">Delay (ms)</label>
+        <input id="delay" type="number" value="500" min="0" max="60000" step="50">
+      </div>
+      <div class="field" style="flex:0 0 150px">
+        <label for="hold">Hold (ms)</label>
+        <input id="hold" type="number" value="300" min="0" max="5000" step="50">
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Ports (1-10)</legend>
+    <div class="ports" id="ports"></div>
+    <div class="actions" style="margin:12px 0 0">
+      <button id="add" type="button">+ Add port</button>
+      <span class="status" id="count"></span>
+    </div>
+  </fieldset>
+
+  <div class="actions">
+    <button id="knock" class="primary" type="button">Knock</button>
+    <button id="clear" type="button">Clear log</button>
+    <button id="forget" type="button">Forget saved</button>
+    <span class="status" id="state">idle</span>
+  </div>
+
+  <div id="log"></div>
+</main>
+
+<script>
+'use strict';
+
+const MAX_PORTS = 10;
+const SAFE_BATCH = 5;
+const INSTANT_FAIL_MS = 100;
+
+const BLOCKED_PORT_RANGES = [
+  [1, 1], [7, 7], [9, 9], [11, 11], [13, 13], [15, 15], [17, 17], [19, 23], [25, 25], [37, 37],
+  [42, 43], [53, 53], [69, 69], [77, 77], [79, 79], [87, 87], [95, 95], [101, 104], [109, 111],
+  [113, 113], [115, 115], [117, 117], [119, 119], [123, 123], [135, 135], [137, 137], [139, 139],
+  [143, 143], [161, 161], [179, 179], [389, 389], [427, 427], [465, 465], [512, 514], [530, 532],
+  [540, 540], [548, 548], [554, 554], [556, 556], [563, 563], [587, 587], [601, 601], [636, 636],
+  [989, 990], [993, 993], [995, 995], [1719, 1720], [1723, 1723], [2049, 2049], [3659, 3659],
+  [4045, 4045], [4190, 4190], [5060, 5061], [6000, 6000], [6566, 6566], [6665, 6669], [6679, 6679],
+  [6697, 6697], [10080, 10080],
+];
+
+function isBlockedPort(port) {
+  return BLOCKED_PORT_RANGES.some(([low, high]) => port >= low && port <= high);
+}
+const portsEl = document.getElementById('ports');
+const addBtn = document.getElementById('add');
+const countEl = document.getElementById('count');
+const knockBtn = document.getElementById('knock');
+const clearBtn = document.getElementById('clear');
+const stateEl = document.getElementById('state');
+const logEl = document.getElementById('log');
+const hostEl = document.getElementById('host');
+const delayEl = document.getElementById('delay');
+const holdEl = document.getElementById('hold');
+const bannerEl = document.getElementById('banner');
+const forgetBtn = document.getElementById('forget');
+
+const STORE_KEY = 'quic-knock:v1';
+const DEFAULTS = { host: '127.0.0.1', delay: 500, hold: 300, ports: ['10000', '10001', '10002'] };
+
+let storageWorks = true;
+let saveTimer = null;
+let knockCount = 0;
+
+function readStore() {
+  let raw;
+  try {
+    raw = localStorage.getItem(STORE_KEY);
+  } catch (err) {
+    storageWorks = false;
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    const data = JSON.parse(raw);
+    return data && typeof data === 'object' && !Array.isArray(data) ? data : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function writeStore() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify({
+      host: hostEl.value,
+      delay: Number(delayEl.value) || 0,
+      hold: Number(holdEl.value) || 0,
+      knockCount,
+      ports: Array.from(portsEl.querySelectorAll('input')).map((i) => i.value),
+    }));
+    return true;
+  } catch (err) {
+    storageWorks = false;
+    return false;
+  }
+}
+
+function forgetStore() {
+  try {
+    localStorage.removeItem(STORE_KEY);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(writeStore, 250);
+}
+
+function clampRange(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+function restoreStore() {
+  const data = readStore();
+  if (!data) return false;
+  knockCount = Number.isInteger(data.knockCount) ? Math.max(0, data.knockCount) : 0;
+  const ports = Array.isArray(data.ports)
+    ? data.ports.map(String).filter((p) => Number.isInteger(Number(p)) && Number(p) >= 1 && Number(p) <= 65535).slice(0, MAX_PORTS)
+    : [];
+  if (!ports.length) return false;
+  if (typeof data.host === 'string' && data.host.trim()) hostEl.value = data.host;
+  delayEl.value = String(clampRange(data.delay, 0, 60000, DEFAULTS.delay));
+  holdEl.value = String(clampRange(data.hold, 0, 5000, DEFAULTS.hold));
+  while (portsEl.children.length) portsEl.children[0].remove();
+  ports.forEach((p) => addPort(p));
+  log(`restored saved values: ${hostEl.value}, ${ports.length} port(s), ${delayEl.value}ms delay, ${holdEl.value}ms hold`, 'muted');
+  return true;
+}
+
+function resetForm() {
+  hostEl.value = DEFAULTS.host;
+  delayEl.value = String(DEFAULTS.delay);
+  holdEl.value = String(DEFAULTS.hold);
+  while (portsEl.children.length) portsEl.children[0].remove();
+  DEFAULTS.ports.forEach((p) => addPort(p));
+}
+
+const inflight = new Set();
+let running = false;
+let cancelled = false;
+let unsent = [];
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function log(text, cls) {
+  const line = document.createElement('div');
+  const stamp = document.createElement('span');
+  stamp.className = 'muted';
+  stamp.textContent = `[${new Date().toLocaleTimeString()}] `;
+  const message = document.createElement('span');
+  message.className = cls || '';
+  message.textContent = text;
+  line.append(stamp, message);
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setState(text, cls) {
+  stateEl.textContent = text;
+  stateEl.className = 'status' + (cls ? ' ' + cls : '');
+}
+
+function syncPorts() {
+  const rows = Array.from(portsEl.children);
+  rows.forEach((row, i) => { row.querySelector('.idx').textContent = `${i + 1}.`; });
+  countEl.textContent = `${rows.length}/${MAX_PORTS}`;
+  addBtn.disabled = rows.length >= MAX_PORTS || running;
+  rows.forEach((row) => { row.querySelector('button').disabled = rows.length <= 1 || running; });
+}
+
+function addPort(value) {
+  if (portsEl.children.length >= MAX_PORTS) return null;
+  const row = document.createElement('div');
+  row.className = 'port';
+
+  const idx = document.createElement('span');
+  idx.className = 'idx';
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = '1';
+  input.max = '65535';
+  input.placeholder = 'port';
+  if (value !== undefined) input.value = value;
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.textContent = 'x';
+  remove.title = 'Remove port';
+  remove.addEventListener('click', () => { row.remove(); syncPorts(); scheduleSave(); });
+
+  row.append(idx, input, remove);
+  input.addEventListener('input', scheduleSave);
+  input.addEventListener('input', markBlocked);
+  portsEl.appendChild(row);
+  syncPorts();
+  if (value === undefined) input.focus();
+  return input;
+}
+
+function readPorts() {
+  return Array.from(portsEl.querySelectorAll('input'))
+    .map((i) => Number(i.value))
+    .filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535);
+}
+
+function markBlocked() {
+  Array.from(portsEl.querySelectorAll('input')).forEach((input) => {
+    const blocked = input.value !== '' && isBlockedPort(Number(input.value));
+    input.style.borderColor = blocked ? '#f87171' : '';
+    input.title = blocked ? 'the browser refuses this port outright - no datagram will be sent' : '';
+  });
+}
+
+function blockedPortsAmong(ports) {
+  return ports.filter(isBlockedPort);
+}
+
+function closeTransport(transport) {
+  inflight.delete(transport);
+  try {
+    transport.close({ closeCode: 0, reason: 'knock sent' });
+  } catch (err) {
+    /* already closed or failed */
+  }
+}
+
+function sendKnock(host, port, position, total, hold, sinceStart) {
+  const url = `https://${host}:${port}`;
+  const started = performance.now();
+  let transport;
+  try {
+    transport = new WebTransport(url);
+  } catch (err) {
+    log(`${port}: browser rejected the URL - ${err.name}: ${err.message}`, 'bad');
+    return;
+  }
+  inflight.add(transport);
+  log(`-> ${port}  connection opened  (${position}/${total}, t+${Math.round(sinceStart)}ms)`, 'muted');
+
+  transport.ready.then(
+    () => {
+      inflight.delete(transport);
+      log(`<- ${port}  QUIC handshake COMPLETED - something answered on this port`, 'ok');
+    },
+    (err) => {
+      inflight.delete(transport);
+      const ms = Math.round(performance.now() - started);
+      const reason = (err && err.message) || 'handshake failed';
+      if (ms < INSTANT_FAIL_MS) {
+        unsent.push(port);
+        const why = isBlockedPort(port)
+          ? 'port is on the browser blocked list'
+          : 'browser hit its failed-handshake limit for this host';
+        log(`<- ${port}  rejected in ${ms}ms - ${why}, no datagram was sent`, 'bad');
+      } else if (/close\(\) is called while connecting/.test(reason)) {
+        log(`<- ${port}  no reply within the ${ms}ms hold window`, 'muted');
+      } else {
+        log(`<- ${port}  handshake gave up after ${ms}ms (${reason})`, 'muted');
+      }
+    }
+  );
+
+  setTimeout(() => closeTransport(transport), hold);
+}
+
+async function knock() {
+  if (running) return;
+  const host = hostEl.value.trim();
+  const ports = readPorts();
+  const delay = clampRange(delayEl.value, 0, 60000, DEFAULTS.delay);
+  const hold = clampRange(holdEl.value, 0, 5000, DEFAULTS.hold);
+
+  if (!host) { log('a host is required', 'bad'); hostEl.focus(); return; }
+  if (!ports.length) { log('at least one valid port is required (1-65535)', 'bad'); return; }
+  if (ports.length > MAX_PORTS) { log(`too many ports (max ${MAX_PORTS})`, 'bad'); return; }
+
+  const blocked = blockedPortsAmong(ports);
+  if (blocked.length) {
+    log(`${blocked.join(', ')} ${blocked.length === 1 ? 'is' : 'are'} on the browser's blocked-port list. Chromium refuses `
+      + `those outright and will never send a datagram to them, in any session. Change the port or expect nothing.`, 'bad');
+  }
+
+  running = true;
+  cancelled = false;
+  unsent = [];
+  knockCount += 1;
+  knockBtn.textContent = 'Stop';
+  setState('knocking', 'warn');
+  syncPorts();
+  writeStore();
+  if (knockCount > 1) {
+    log(`knock #${knockCount} from this browser profile. Chromium's limit on failed QUIC handshakes to one host is per `
+      + `browser process, so if a port below is refused, fully quit the browser (every window) and reopen this file.`, 'warn');
+  }
+  if (ports.length > SAFE_BATCH) {
+    log(`warning: ${ports.length} ports in one session. Chromium stops opening QUIC connections to a host after a run of `
+      + `failed handshakes, and every knock is one, so later ports can send nothing at all. Measured with 10 ports: `
+      + `hold 100ms sends 6/10, 300ms sends 7/10, 5000ms sends 10/10 but the last packet lands seconds late. `
+      + `For a tight sequence, knock ${SAFE_BATCH} at a time, restart the browser between batches, and keep hold small.`, 'warn');
+  }
+  log(`knocking ${ports.length} port(s) on ${host} over UDP, ${delay}ms apart, ${hold}ms hold`, 'muted');
+
+  const sequenceStart = performance.now();
+  for (let i = 0; i < ports.length; i += 1) {
+    const target = sequenceStart + i * delay;
+    const wait = target - performance.now();
+    if (wait > 0) await sleep(wait);
+    if (cancelled) break;
+    sendKnock(host, ports[i], i + 1, ports.length, hold, performance.now() - sequenceStart);
+  }
+
+  if (cancelled) {
+    log('cancelled', 'warn');
+    setState('cancelled', 'warn');
+  } else if (unsent.length) {
+    const blockedHere = unsent.filter(isBlockedPort);
+    const limited = unsent.filter((p) => !isBlockedPort(p));
+    if (blockedHere.length) {
+      log(`no datagram was sent for ${blockedHere.join(', ')} - blocked port(s), the browser always refuses these.`, 'bad');
+    }
+    if (limited.length) {
+      log(`no datagram was sent for ${limited.join(', ')} - Chromium limits failed QUIC handshakes per host per browser `
+        + `process, and a knock is nothing but failed handshakes. Fully quit the browser (every window) and knock again.`, 'bad');
+    }
+    setState(`${unsent.length} port(s) sent nothing`, 'bad');
+  } else {
+    log(`all ${ports.length} port(s) attempted - the page cannot confirm the datagrams arrived, check your target's log`, 'ok');
+    setState('attempted, verify on target', 'ok');
+  }
+  running = false;
+  knockBtn.textContent = 'Knock';
+  syncPorts();
+}
+
+function stop() {
+  if (!running) return;
+  cancelled = true;
+  const pending = inflight.size;
+  for (const transport of Array.from(inflight)) closeTransport(transport);
+  inflight.clear();
+  log(`stopped, closed ${pending} pending handshake(s)`, 'muted');
+}
+
+addBtn.addEventListener('click', () => { addPort(); scheduleSave(); });
+clearBtn.addEventListener('click', () => { logEl.textContent = ''; });
+knockBtn.addEventListener('click', () => (running ? stop() : knock()));
+hostEl.addEventListener('input', scheduleSave);
+delayEl.addEventListener('input', scheduleSave);
+holdEl.addEventListener('input', scheduleSave);
+forgetBtn.addEventListener('click', () => {
+  forgetStore();
+  resetForm();
+  syncPorts();
+  log('saved values cleared', 'warn');
+});
+
+function supported() {
+  if (typeof WebTransport !== 'function') {
+    bannerEl.textContent = 'This browser has no WebTransport API, so no QUIC packet can be sent. '
+      + 'Verified working in Chromium; Firefox 140 was observed to send nothing.';
+    bannerEl.classList.add('show');
+    knockBtn.disabled = true;
+    setState('unsupported', 'bad');
+    log('WebTransport is not available in this browser', 'bad');
+    return false;
+  }
+  if (!window.isSecureContext) {
+    bannerEl.textContent = 'Not a secure context. WebTransport is blocked. '
+      + 'Open this file directly (file:// works) or serve it over http://localhost or https.';
+    bannerEl.classList.add('show');
+    knockBtn.disabled = true;
+    setState('insecure context', 'bad');
+    log('window.isSecureContext is false - WebTransport is blocked', 'bad');
+    return false;
+  }
+  return true;
+}
+
+function readQuery() {
+  const params = new URLSearchParams(location.search);
+  if (params.has('host')) hostEl.value = params.get('host');
+  if (params.has('ports')) {
+    const wanted = params.get('ports').split(',').map((s) => s.trim()).filter(Boolean).slice(0, MAX_PORTS);
+    while (portsEl.children.length) portsEl.children[0].remove();
+    wanted.forEach((p) => addPort(p));
+  }
+  if (params.has('delay')) delayEl.value = params.get('delay');
+  if (params.has('hold')) holdEl.value = params.get('hold');
+  return params.get('auto') === '1';
+}
+
+const ready = supported();
+restoreStore();
+if (portsEl.children.length === 0) {
+  DEFAULTS.ports.forEach((p) => addPort(p));
+}
+const autostart = readQuery();
+syncPorts();
+if (!storageWorks) {
+  log('browser storage is unavailable - values will not be remembered', 'warn');
+}
+if (ready) {
+  log('WebTransport available - ready to knock', 'ok');
+  if (autostart) knock();
+} else {
+  log('cannot knock from this browser', 'bad');
+}
+</script>
+</body>
+</html>
